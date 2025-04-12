@@ -371,6 +371,9 @@ rocksdb::Status Database::Scan(engine::Context &ctx, const std::string &cursor, 
       }
       keys->emplace_back(user_key);
       cnt++;
+      if (limit > 0 && cnt >= limit) {
+        break;
+      }
     }
 
     if (auto s = iter->status(); !s.ok()) {
@@ -936,35 +939,55 @@ bool RedisSortObject::SortCompare(const RedisSortObject &a, const RedisSortObjec
   }
 }
 
-rocksdb::Status Database::DeletePrefix(engine::Context & /*ctx*/, const Slice &prefix, uint64_t *deleted_cnt) {
+rocksdb::Status Database::DeletePrefix([[maybe_unused]] engine::Context &ctx, const rocksdb::Slice &prefix, uint64_t *deleted_cnt) {
   *deleted_cnt = 0;
 
   auto db = storage_->GetDB();
   if (!db) return rocksdb::Status::NotFound("DB not initialized");
 
-  rocksdb::ReadOptions read_options;
-  std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(read_options));
-  if (!it) return rocksdb::Status::NotFound("Failed to create iterator");
+  // Handle namespace and slot encoding - note that prefix is already namespace-prefixed
+  std::string ns_prefix = prefix.ToString(); // Use the already prefixed key
+  std::string end_prefix = util::StringNext(ns_prefix);
 
-  rocksdb::WriteBatch batch;
-  for (it->Seek(prefix); it->Valid(); it->Next()) {
-    if (!it->key().starts_with(prefix)) break;
-    batch.Delete(it->key());
+  LOG(INFO) << "Deleting keys with prefix: " << ns_prefix;
+  LOG(INFO) << "End prefix: " << end_prefix;
+
+  // First, count and collect keys to delete
+  rocksdb::ReadOptions read_options;
+  std::vector<std::string> keys_to_delete;
+  auto iter = std::unique_ptr<rocksdb::Iterator>(db->NewIterator(read_options));
+  for (iter->Seek(ns_prefix); iter->Valid() && iter->key().starts_with(ns_prefix); iter->Next()) {
+    keys_to_delete.push_back(iter->key().ToString());
     (*deleted_cnt)++;
   }
-
-  if (!it->status().ok()) {
-    return rocksdb::Status::NotFound("Iterator error: " + it->status().ToString());
+  
+  if (*deleted_cnt == 0) {
+    // No keys to delete
+    return rocksdb::Status::OK();
   }
 
-  if (*deleted_cnt > 0) {
-    rocksdb::WriteOptions write_options;
-    rocksdb::Status s = db->Write(write_options, &batch);
-    if (!s.ok()) {
-      return rocksdb::Status::NotFound("Write batch error: " + s.ToString());
-    }
+  // First use DeleteRange for efficiency
+  rocksdb::WriteOptions write_options;
+  auto s = db->DeleteRange(write_options, db->DefaultColumnFamily(), ns_prefix, end_prefix);
+  if (!s.ok()) {
+    LOG(ERROR) << "DeleteRange failed: " << s.ToString();
+    return rocksdb::Status::IOError("DeleteRange error: " + s.ToString());
   }
 
+  // Then explicitly delete each key to ensure immediate visibility
+  rocksdb::WriteBatch batch;
+  for (const auto& key : keys_to_delete) {
+    batch.Delete(key);
+  }
+  
+  s = db->Write(write_options, &batch);
+  if (!s.ok()) {
+    LOG(ERROR) << "Manual deletion after DeleteRange failed: " << s.ToString();
+    return rocksdb::Status::IOError("Manual deletion error: " + s.ToString());
+  }
+
+  LOG(INFO) << "DeleteRange succeeded for prefix: " << ns_prefix;
+  LOG(INFO) << "Deleted keys count: " << *deleted_cnt;
   return rocksdb::Status::OK();
 }
 

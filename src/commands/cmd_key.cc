@@ -359,43 +359,42 @@ class CommandDel : public Commander {
 
 class CommandDelPrefix : public Commander {
  public:
-  Status Execute(engine::Context & /*ctx*/, Server *srv, Connection * /*conn*/, std::string *output) override {
-    if (args_.size() < 2) return {Status::NotOK, "Missing prefix argument"};
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+    if (args_.size() != 2) {
+      return {Status::RedisParseErr, "wrong number of arguments for 'delprefix' command"};
+    }
 
     std::string prefix = args_[1];
-    if (prefix.empty()) return {Status::NotOK, "Prefix cannot be empty"};
-
-    auto db = srv->storage->GetDB();
-    if (!db) return {Status::NotOK, "DB not initialized"};
-
-    // Creating an iterator with ReadOptions
-    rocksdb::ReadOptions read_options;
-    std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(read_options));
-    if (!it) return {Status::NotOK, "Failed to create iterator"};
-
-    rocksdb::WriteBatch batch;
-    int delete_count = 0;
-
-    for (it->Seek(prefix); it->Valid(); it->Next()) {
-      if (!it->key().starts_with(rocksdb::Slice(prefix))) break;
-      batch.Delete(it->key());
-      delete_count++;
+    if (prefix.empty()) {
+      return {Status::RedisParseErr, "Prefix cannot be empty"};
     }
 
-    if (!it->status().ok()) {
-      return {Status::NotOK, "Iterator error: " + it->status().ToString()};
-    }
+    // Prepend namespace to the prefix
+    redis::Database redis(srv->storage, conn->GetNamespace());
+    std::string ns_prefix = redis.AppendNamespacePrefix(prefix);
 
-    // Only write batch if there are keys to delete
-    if (delete_count > 0) {
-      rocksdb::WriteOptions write_options;
-      rocksdb::Status s = db->Write(write_options, &batch);
-      if (!s.ok()) {
-        return {Status::NotOK, "Write batch error: " + s.ToString()};
+    LOG(INFO) << "Namespace: " << conn->GetNamespace();
+    LOG(INFO) << "Prefix: " << prefix;
+    LOG(INFO) << "Namespace-prefixed prefix: " << ns_prefix;
+
+    // Validate prefix compatibility in cluster mode
+    if (srv->storage->IsSlotIdEncoded()) {
+      uint16_t slot = GetSlotIdFromKey(ns_prefix);
+      if (slot != GetSlotIdFromKey(ns_prefix)) {
+        return {Status::RedisExecErr, "Prefix is not compatible with cluster mode"};
       }
     }
 
-    *output = std::to_string(delete_count);
+    uint64_t deleted_cnt = 0;
+    // FIX: Pass ns_prefix instead of prefix
+    auto s = redis.DeletePrefix(ctx, ns_prefix, &deleted_cnt);
+    if (!s.ok()) {
+      LOG(ERROR) << "DeletePrefix failed: " << s.ToString();
+      return {Status::RedisExecErr, "DeletePrefix error: " + s.ToString()};
+    }
+
+    LOG(INFO) << "Deleted keys count: " << deleted_cnt;
+    *output = redis::Integer(deleted_cnt);  // Return the number of deleted keys
     return Status::OK();
   }
 };
@@ -642,9 +641,9 @@ REDIS_REGISTER_COMMANDS(Key, MakeCmdAttr<CommandTTL>("ttl", 2, "read-only", 1, 1
                         MakeCmdAttr<CommandRename>("rename", 3, "write", 1, 2, 1),
                         MakeCmdAttr<CommandRenameNX>("renamenx", 3, "write", 1, 2, 1),
                         MakeCmdAttr<CommandCopy>("copy", -3, "write", 1, 2, 1),
-                        MakeCmdAttr<CommandDelPrefix>("delprefix", 2, "write", 1, 1, 1),
                         MakeCmdAttr<CommandSort<false>>("sort", -2, "write slow", 1, 1, 1),
                         MakeCmdAttr<CommandSort<true>>("sort_ro", -2, "read-only slow", 1, 1, 1),
+                        MakeCmdAttr<CommandDelPrefix>("delprefix", 2, "write", 1, 1, 1),
                         MakeCmdAttr<CommandKMetadata>("kmetadata", 2, "read-only", 1, 1, 1))
 
 }  // namespace redis

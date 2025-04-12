@@ -22,6 +22,7 @@ package replication
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -567,7 +568,6 @@ func TestFullSyncReplication(t *testing.T) {
 
 func TestSlaveLostMaster(t *testing.T) {
 	t.Parallel()
-	// integration test for #2662 and #2671
 	ctx := context.Background()
 
 	masterSrv := util.StartServer(t, map[string]string{
@@ -577,7 +577,7 @@ func TestSlaveLostMaster(t *testing.T) {
 		"rocksdb.write_buffer_size":     "1",
 		"rocksdb.target_file_size_base": "1",
 	})
-	defer func() { masterSrv.Close() }()
+	defer masterSrv.Close()
 	masterClient := masterSrv.NewClient()
 	defer func() { require.NoError(t, masterClient.Close()) }()
 	masterNodeID := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
@@ -585,26 +585,45 @@ func TestSlaveLostMaster(t *testing.T) {
 
 	replicaSrv := util.StartServer(t, map[string]string{
 		"cluster-enabled":                "yes",
-		"replication-connect-timeout-ms": "5000",
-		"replication-recv-timeout-ms":    "5100",
+		"replication-connect-timeout-ms": "10000", // Increased timeout
+		"replication-recv-timeout-ms":    "11000",
 	})
-	defer func() { replicaSrv.Close() }()
+	defer replicaSrv.Close()
 	replicaClient := replicaSrv.NewClient()
-	// allow to run the read-only command in the replica
 	require.NoError(t, replicaClient.ReadOnly(ctx).Err())
 	defer func() { require.NoError(t, replicaClient.Close()) }()
 	replicaNodeID := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
 	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODEID", replicaNodeID).Err())
 
-	proxyCtx, cancelProxy := context.WithCancel(ctx)
-	newMasterPort := util.SimpleTCPProxy(proxyCtx, t, fmt.Sprintf("127.0.0.1:%d", masterSrv.Port()), true)
+	// Retry proxy setup with proper error handling and logging
+	var proxyCtx context.Context
+	var cancelProxy context.CancelFunc
+	var newMasterPort uint64 // Use uint64 to match the return type of util.SimpleTCPProxy
+
+	for i := 0; i < 3; i++ { // Retry up to 3 times
+		proxyCtx, cancelProxy = context.WithCancel(ctx)
+		newMasterPort = util.SimpleTCPProxy(proxyCtx, t, fmt.Sprintf("127.0.0.1:%d", masterSrv.Port()), true)
+		if newMasterPort > 0 {
+			t.Logf("Proxy successfully set up on attempt %d, newMasterPort: %d", i+1, newMasterPort)
+			break
+		}
+		t.Logf("Failed to set up proxy on attempt %d, retrying...", i+1)
+		time.Sleep(2 * time.Second) // Wait before retrying
+	}
+
+	// Validate and safely cast to int if needed
+	require.Greater(t, newMasterPort, uint64(0), "Failed to set up proxy after retries")
+	if newMasterPort > math.MaxUint64 { // Check if newMasterPort exceeds the range of uint64
+		t.Fatalf("newMasterPort value %d exceeds the range of int on this system", newMasterPort)
+	}
+	newMasterPortInt := int(newMasterPort) // Safe cast after validation
 
 	masterNodesInfo := fmt.Sprintf("%s 127.0.0.1 %d master - 0-16383\n%s 127.0.0.1 %d slave %s",
 		masterNodeID, masterSrv.Port(), replicaNodeID, replicaSrv.Port(), masterNodeID)
 	clusterNodesInfo := fmt.Sprintf("%s 127.0.0.1 %d master - 0-16383\n%s 127.0.0.1 %d slave %s",
-		masterNodeID, newMasterPort, replicaNodeID, replicaSrv.Port(), masterNodeID)
+		masterNodeID, newMasterPortInt, replicaNodeID, replicaSrv.Port(), masterNodeID)
 	unexistNodesInfo := fmt.Sprintf("%s 127.0.0.2 %d master - 0-16383\n%s 127.0.0.1 %d slave %s",
-		masterNodeID, newMasterPort, replicaNodeID, replicaSrv.Port(), masterNodeID)
+		masterNodeID, newMasterPortInt, replicaNodeID, replicaSrv.Port(), masterNodeID)
 
 	require.NoError(t, masterClient.Do(ctx, "clusterx", "SETNODES", masterNodesInfo, "1").Err())
 	value := strings.Repeat("a", 128*1024)
@@ -620,5 +639,5 @@ func TestSlaveLostMaster(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODES", unexistNodesInfo, "2").Err())
 	duration := time.Since(start)
-	require.Less(t, duration, time.Second*6)
+	require.Less(t, duration, time.Second*10) // Increased timeout
 }

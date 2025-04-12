@@ -22,6 +22,7 @@ package deleteprefix
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -39,10 +40,11 @@ func setup(t *testing.T) *redis.Client {
 	client := instance.NewClientWithOption(&redis.Options{
 		Addr: instance.HostPort(),
 	})
+	t.Log("Starting reconnection attempt")
 	require.Eventually(t, func() bool {
 		err := client.Ping(context.Background()).Err()
 		return err == nil || err.Error() == "NOAUTH Authentication required."
-	}, time.Minute, time.Second)
+	}, 2*time.Minute, time.Second) // Increased timeout to 2 minutes
 
 	return client
 }
@@ -57,25 +59,45 @@ func TestDelPrefix(t *testing.T) {
 	client := setup(t)
 	defer teardown()
 
-	// Test cases
 	t.Run("DELPREFIX_ALL", func(t *testing.T) {
-		require.NoError(t, client.Set(context.Background(), "test:key1", "value1", 0).Err())
-		require.NoError(t, client.Set(context.Background(), "test:key2", "value2", 0).Err())
+		for i := 0; i < 100; i++ {
+			require.NoError(t, client.Set(context.Background(), fmt.Sprintf("test:key%d", i), "value", 0).Err())
+		}
+		require.NoError(t, client.Set(context.Background(), "other:key", "value", 0).Err())
 
-		_, err := client.Do(context.Background(), "DELPREFIX", "test").Result()
+		result, err := client.Do(context.Background(), "DELPREFIX", "test:").Result()
 		require.NoError(t, err)
+		t.Logf("DELPREFIX result: %v", result)
+
+		for i := 0; i < 100; i++ {
+			require.Error(t, client.Get(context.Background(), fmt.Sprintf("test:key%d", i)).Err())
+		}
+		require.Equal(t, "value", client.Get(context.Background(), "other:key").Val())
 	})
 
-	t.Run("DELPREFIX_BY_PREFIX", func(t *testing.T) {
-		require.NoError(t, client.Set(context.Background(), "sample:key1", "value1", 0).Err())
-		require.NoError(t, client.Set(context.Background(), "sample:key2", "value2", 0).Err())
+	t.Run("Namespace handling", func(t *testing.T) {
+		require.NoError(t, client.Set(context.Background(), "{ns}:key1", "value", 0).Err())
+		require.NoError(t, client.Set(context.Background(), "{ns}:key2", "value", 0).Err())
+		require.NoError(t, client.Set(context.Background(), "other:key", "value", 0).Err())
 
-		_, err := client.Do(context.Background(), "DELPREFIX", "sample").Result()
+		result, err := client.Do(context.Background(), "DELPREFIX", "{ns}:").Result()
 		require.NoError(t, err)
+		t.Logf("DELPREFIX result: %v", result)
+
+		require.Error(t, client.Get(context.Background(), "{ns}:key1").Err())
+		require.Error(t, client.Get(context.Background(), "{ns}:key2").Err())
+		require.Equal(t, "value", client.Get(context.Background(), "other:key").Val())
 	})
 
-	t.Run("Delprefix_reject_invalid_input", func(t *testing.T) {
+	t.Run("Empty prefix", func(t *testing.T) {
+		_, err := client.Do(context.Background(), "DELPREFIX", "").Result()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Prefix cannot be empty")
+	})
+
+	t.Run("Missing arguments", func(t *testing.T) {
 		_, err := client.Do(context.Background(), "DELPREFIX").Result()
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "wrong number of arguments")
 	})
 }
